@@ -1,210 +1,258 @@
+import telebot
 import requests
 import json
 import random
 import time
 import schedule
 import pytz
+import threading
+import os
 from datetime import datetime, timedelta
 import sys
 
 BASE_URL = "https://erp.tbsolutions.mn"
 AUTH_URL = f"{BASE_URL}/web/session/authenticate"
 CALL_BUTTON_URL = f"{BASE_URL}/web/dataset/call_button"
-SEARCH_READ_URL = f"{BASE_URL}/web/dataset/call_kw/hr.employee/search_read"
-
-USERNAME = "gantulga.b@tavanbogd.com"
-PASSWORD = "Thelofx123!"
+CALENDAR_READ_URL = f"{BASE_URL}/web/dataset/call_kw/hr.attendance.calendar/read"
 DB_NAME = "prod_tbs240122"
 
-TELEGRAM_BOT_TOKEN = "8472658405:AAGwMoGkZTfH4O7oV89HhEkjmj6dyPDNhwA"
-TELEGRAM_CHAT_ID = "6190430690"
+API_TOKEN = '8472658405:AAGwMoGkZTfH4O7oV89HhEkjmj6dyPDNhwA'
+bot = telebot.TeleBot(API_TOKEN)
 
 UB_TZ = pytz.timezone('Asia/Ulaanbaatar')
+DATABASE_FILE = "janus_users.json"
 
-def log(message, overwrite=False):
+MORNING_WINDOW_MIN = 30 
+MORNING_WINDOW_MAX = 45 
+WORK_HOURS_TARGET = 9   
+OVERTIME_MIN = 10       
+OVERTIME_MAX = 15       
+
+def load_users():
+    if not os.path.exists(DATABASE_FILE): return {}
+    try:
+        with open(DATABASE_FILE, 'r') as f: return json.load(f)
+    except: return {}
+
+def save_user(chat_id, email, password, name="Unknown"):
+    users = load_users()
+    users[str(chat_id)] = {"email": email, "password": password, "name": name}
+    with open(DATABASE_FILE, 'w') as f: json.dump(users, f, indent=4)
+
+def log(message):
     timestamp = datetime.now(UB_TZ).strftime('%H:%M:%S')
-    msg = f"[{timestamp}] {message}"
-    
-    if overwrite:
-        sys.stdout.write(f"\r{msg}          ")
-        sys.stdout.flush()
-    else:
-        if overwrite is False: sys.stdout.write("\n")
-        print(msg)
+    print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
 
-def send_telegram(message):
-    """
-    Robust Telegram Sender with Retry Logic.
-    Tries 3 times to send the message. If it fails, it just logs locally.
-    """
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(url, json=payload, timeout=5)
-            if r.status_code == 200:
-                return 
-            elif r.status_code >= 500:
-                log(f"⚠️ Telegram Server Error ({r.status_code}). Retrying ({attempt}/3)...")
-                time.sleep(2)
-            else:
-                log(f"⚠️ Telegram Client Error: {r.text}")
-                return 
-        except Exception as e:
-            log(f"⚠️ Telegram Connection Fail. Retrying ({attempt}/3)...")
-            time.sleep(2)
-    
-    log("❌ Telegram failed after 3 attempts. Message skipped.")
+def send_telegram(chat_id, message):
+    try:
+        bot.send_message(chat_id, message, parse_mode="Markdown")
+    except:
+        log(f"Telegram Fail: {message}")
 
-def get_session():
+def get_session(email, password):
     s = requests.Session()
     payload = {
         "jsonrpc": "2.0", "method": "call",
-        "params": {"db": DB_NAME, "login": USERNAME, "password": PASSWORD},
+        "params": {"db": DB_NAME, "login": email, "password": password},
         "id": random.randint(1, 1000)
     }
     try:
-        r = s.post(AUTH_URL, json=payload, timeout=30)
-        data = r.json()
-        if "error" in data:
-            log(f"Login Fail: {data['error']['message']}")
-            send_telegram(f"⚠️ Login Failed: {data['error']['message']}")
-            return None, None
-        return s, data.get("result", {}).get("uid")
-    except Exception as e:
-        log(f"Net Error: {e}")
-        return None, None
+        r = s.post(AUTH_URL, json=payload, timeout=20)
+        res = r.json().get("result", {})
+        if "uid" in res:
+            return s, {"uid": res.get("uid"), "name": res.get("name", "User")}
+        return None, "Login Failed"
+    except Exception as e: return None, str(e)
 
-def get_current_status(session, uid):
+def get_calendar_data(session, uid):
     payload = {
         "jsonrpc": "2.0", "method": "call",
         "params": {
-            "model": "hr.employee",
-            "method": "search_read",
-            "args": [[['user_id', '=', uid]]],
-            "kwargs": {"fields": ["attendance_state"], "limit": 1}
+            "model": "hr.attendance.calendar",
+            "method": "read",
+            "args": [[1], ["checked_in_today", "attendance_calendar_json", "name"]],
+            "kwargs": {"context": {"lang": "en_US", "tz": "Asia/Ulaanbaatar", "uid": uid, "allowed_company_ids": [1], "compute_calendar_month": True}}
         },
         "id": random.randint(1, 1000)
     }
-    headers = {"Content-Type": "application/json", "Referer": BASE_URL}
     try:
-        r = session.post(SEARCH_READ_URL, json=payload, headers=headers, timeout=20)
-        data = r.json()
-        if "result" in data and len(data["result"]) > 0:
-            return data["result"][0].get("attendance_state")
+        r = session.post(CALENDAR_READ_URL, json=payload, headers={"Content-Type": "application/json", "Referer": BASE_URL}, timeout=20)
+        return r.json().get("result", [])
+    except: return None
+
+def get_real_checkin_time(calendar_result):
+    try:
+        today_str = datetime.now(UB_TZ).strftime("%Y-%m-%d")
+        if not calendar_result: return None
+        
+        raw_json = calendar_result[0].get("attendance_calendar_json", {})
+        weeks = raw_json.get("weeks", [])
+        
+        for week in weeks:
+            for day_obj in week:
+                if day_obj.get("day") == today_str:
+                    time_str = day_obj.get("day_data", {}).get("in_out", "")
+                    if not time_str: return None
+                    
+                    check_in_str = time_str.split(" - ")[0].strip()
+                    if ":" in check_in_str:
+                        return datetime.strptime(f"{today_str} {check_in_str}", "%Y-%m-%d %H:%M:%S")
+        return None
     except Exception as e:
-        log(f"Status Read Error: {e}")
-    return None
+        log(f"Parser Error: {e}")
+        return None
 
-def punch_clock(action_type):
-    sys.stdout.write("\n")
-    log(f"⏰ Executing {action_type}...")
-    
-    session, uid = get_session()
-    if not session: return
+def execute_punch(chat_id, action_type):
+    users = load_users()
+    user = users.get(str(chat_id))
+    if not user: return
 
-    current_state = get_current_status(session, uid)
-    
-    if action_type == "check_in" and current_state == "checked_in":
-        log("⚠️ Already Checked In. Skipping.")
-        send_telegram("⚠️ Triggered Check-in, but already Checked In.")
-        return
-    
-    if action_type == "check_out" and current_state == "checked_out":
-        log("⚠️ Already Checked Out. Skipping.")
-        send_telegram("⚠️ Triggered Check-out, but already Checked Out.")
+    time.sleep(random.randint(2, 15))
+
+    session, user_data = get_session(user['email'], user['password'])
+    if not session:
+        send_telegram(chat_id, f"❌ **Login Failed** during {action_type}")
         return
 
-    time.sleep(random.randint(2, 10))
+    cal_data = get_calendar_data(session, user_data['uid'])
+    is_checked_in = cal_data[0].get("checked_in_today", False) if cal_data else False
+    
+    if action_type == "check_in" and is_checked_in:
+        log(f"Skip In: {user['email']} (Already In)")
+        return
+    if action_type == "check_out" and not is_checked_in:
+        log(f"Skip Out: {user['email']} (Already Out)")
+        return
 
+    method = "check_out" if action_type == "check_out" else "check_in"
     payload = {
         "id": random.randint(10, 1000),
         "jsonrpc": "2.0", "method": "call",
         "params": {
             "args": [[1]], 
-            "kwargs": {"context": {"compute_calendar_month": True, "lang": "en_US", "tz": "Asia/Ulaanbaatar", "uid": uid, "allowed_company_ids": [1]}},
-            "method": action_type, "model": "hr.attendance.calendar"
+            "kwargs": {"context": {"tz": "Asia/Ulaanbaatar", "uid": user_data['uid'], "allowed_company_ids": [1]}},
+            "method": method, "model": "hr.attendance.calendar"
         }
     }
     
-    headers = {"Content-Type": "application/json", "Referer": BASE_URL, "User-Agent": "Mozilla/5.0"}
-
     try:
-        r = session.post(CALL_BUTTON_URL, json=payload, headers=headers, timeout=30)
+        r = session.post(CALL_BUTTON_URL, json=payload, headers={"Content-Type": "application/json", "Referer": BASE_URL}, timeout=30)
         if "error" not in r.json():
-            msg = f"✅ Success: {action_type.replace('_', ' ').title()}"
-            log(msg)
-            send_telegram(msg)
+            send_telegram(chat_id, f"✅ **{action_type.replace('_',' ').title()} Success!**")
+            log(f"Success {action_type}: {user['email']}")
         else:
-            err = r.json()['error']['message']
-            log(f"❌ Odoo Error: {err}")
-            send_telegram(f"⚠️ Odoo Error: {err}")
+            send_telegram(chat_id, f"⚠️ Odoo Error: {r.json()['error']['message']}")
     except Exception as e:
         log(f"Req Error: {e}")
 
-def daily_scheduler():
-    schedule.clear('tasks')
+def plan_checkout_strategy():
+    log("Running Mid-Day Checkout Planner...")
+    users = load_users()
     ub_now = datetime.now(UB_TZ)
     
-    if ub_now.weekday() >= 5:
-        log(f"Weekend ({ub_now.strftime('%A')}). Idling...")
-        send_telegram("🏖 Weekend Mode. No actions.")
+    if ub_now.weekday() >= 5: return 
+
+    for chat_id, user in users.items():
+        session, u_data = get_session(user['email'], user['password'])
+        if not session: continue
+        
+        cal_data = get_calendar_data(session, u_data['uid'])
+        actual_in_dt = get_real_checkin_time(cal_data)
+        
+        if actual_in_dt:
+            buffer_mins = random.randint(OVERTIME_MIN, OVERTIME_MAX)
+            target_out_dt = actual_in_dt + timedelta(hours=WORK_HOURS_TARGET, minutes=buffer_mins)
+            
+            out_str = target_out_dt.strftime("%H:%M:%S")
+            in_str = actual_in_dt.strftime("%H:%M:%S")
+            
+            schedule.every().day.at(out_str).do(execute_punch, chat_id=chat_id, action_type="check_out").tag('daily')
+            
+            log(f"User {user['email']}: In at {in_str}. Out set for {out_str} (+{buffer_mins}m buffer)")
+            send_telegram(chat_id, f"📅 **Day Plan**\n✅ In: `{in_str}`\n🎯 Target Out: `{out_str}`\n(8h + {buffer_mins}m buffer)")
+        else:
+            fallback_time = f"18:{random.randint(10, 30):02d}:00"
+            schedule.every().day.at(fallback_time).do(execute_punch, chat_id=chat_id, action_type="check_out").tag('daily')
+            log(f"⚠️ No Check-in found for {user['email']}. Fallback Out set for {fallback_time}")
+
+def schedule_daily_tasks():
+    schedule.clear('daily')
+    ub_now = datetime.now(UB_TZ)
+    
+    if ub_now.weekday() >= 5: 
+        log("Weekend Mode. No tasks.")
         return
 
-    m_hour, m_min = 8, random.randint(30, 35)
-    e_hour, e_min = 18, random.randint(10, 20)
+    users = load_users()
+    for chat_id, user in users.items():
+        m_min = random.randint(MORNING_WINDOW_MIN, MORNING_WINDOW_MAX)
+        m_sec = random.randint(0, 59)
+        m_time = f"08:{m_min:02d}:{m_sec:02d}"
+        
+        schedule.every().day.at(m_time).do(execute_punch, chat_id=chat_id, action_type="check_in").tag('daily')
+        log(f"Scheduled In for {user['email']}: {m_time}")
+
+    schedule.every().day.at("11:00:00").do(plan_checkout_strategy).tag('daily')
     
-    morning_str = f"{m_hour:02d}:{m_min:02d}"
-    evening_str = f"{e_hour:02d}:{e_min:02d}"
-
-    log(f"Target: In@{morning_str}, Out@{evening_str}")
-
-    today_morning = ub_now.replace(hour=m_hour, minute=m_min, second=0, microsecond=0)
-    today_evening = ub_now.replace(hour=e_hour, minute=e_min, second=0, microsecond=0)
-
-    if ub_now > today_morning and ub_now < today_evening:
-        log("⚠️ Late Start Detected. Checking Status...")
-        session, uid = get_session()
-        if session:
-            state = get_current_status(session, uid)
-            if state == "checked_out":
-                log("🚨 MISSED MORNING! Recovering...")
-                send_telegram("🚨 **Missed Morning.** Recovering...")
-                punch_clock("check_in")
-            else:
-                log("Status OK.")
+    current_time_str = ub_now.strftime("%H:%M")
+    if current_time_str > "08:45" and current_time_str < "11:00":
+        for chat_id in users:
+            threading.Thread(target=execute_punch, args=(chat_id, "check_in")).start()
     
-    elif ub_now > today_evening:
-         log("⚠️ Late Evening Detected. Checking Status...")
-         session, uid = get_session()
-         if session:
-            state = get_current_status(session, uid)
-            if state == "checked_in":
-                log("🚨 MISSED EVENING! Recovering...")
-                send_telegram("🚨 **Missed Evening.** Recovering...")
-                punch_clock("check_out")
+    if current_time_str > "11:00":
+        threading.Thread(target=plan_checkout_strategy).start()
 
-    schedule.every().day.at(morning_str).do(punch_clock, action_type="check_in").tag('tasks')
-    schedule.every().day.at(evening_str).do(punch_clock, action_type="check_out").tag('tasks')
-    
-    send_telegram(f"📅 **Plan for {ub_now.strftime('%A')}**\nTarget In: `{morning_str}`\nTarget Out: `{evening_str}`")
+@bot.message_handler(commands=['start'])
+def welcome(m): bot.reply_to(m, "Janus v2.3 Active.\nUse /register email pass")
 
-if __name__ == "__main__":
-    log("System Init. Checking State & Schedule...")
-    daily_scheduler()
-    schedule.every().day.at("01:00").do(daily_scheduler)
-    
+@bot.message_handler(commands=['register'])
+def reg(m):
+    try:
+        email, pwd = m.text.split()[1], m.text.split()[2]
+        if get_session(email, pwd)[0]:
+            save_user(m.chat.id, email, pwd)
+            bot.reply_to(m, "Registered.")
+            schedule_daily_tasks()
+        else: bot.reply_to(m, "Login Failed.")
+    except: pass
+
+@bot.message_handler(commands=['status'])
+def stat(m):
+    users = load_users()
+    u = users.get(str(m.chat.id))
+    if not u: return
+    s, d = get_session(u['email'], u['password'])
+    if s:
+        cal = get_calendar_data(s, d['uid'])
+        real_in = get_real_checkin_time(cal)
+        state = "Checked In" if cal[0]['checked_in_today'] else "Checked Out"
+        time_txt = real_in.strftime("%H:%M:%S") if real_in else "--:--:--"
+        bot.reply_to(m, f"Status: {state}\nIn Time: `{time_txt}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=['in'])
+def force_in(m): execute_punch(m.chat.id, "check_in")
+
+@bot.message_handler(commands=['out'])
+def force_out(m): execute_punch(m.chat.id, "check_out")
+
+def run_scheduler():
     while True:
         schedule.run_pending()
-        try:
-            next_run = schedule.next_run()
-            if next_run:
-                delta = next_run - datetime.now()
-                minutes = int(delta.total_seconds() / 60)
-                log(f"Status: Armed. Next: {minutes} min", overwrite=True)
-            else:
-                log("Status: Idle (Tasks done or Weekend)", overwrite=True)
-        except:
-            pass
         time.sleep(1)
+
+if __name__ == "__main__":
+    schedule.every().day.at("01:00").do(schedule_daily_tasks)
+    schedule_daily_tasks()
+    
+    t = threading.Thread(target=run_scheduler)
+    t.daemon = True
+    t.start()
+    
+    print("--- JANUS v2.3 REACTIVE ---")
+    while True:
+        try:
+            bot.polling(non_stop=True, interval=2, timeout=30)
+        except Exception as e:
+            log(f"Bot crash: {e}")
+            time.sleep(5)
