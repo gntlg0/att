@@ -280,7 +280,9 @@ def plan_checkout_strategy():
         
         if actual_in_dt:
             buffer_mins = random.randint(OVERTIME_MIN, OVERTIME_MAX)
-            target_out_dt = actual_in_dt + timedelta(hours=WORK_HOURS_TARGET, minutes=buffer_mins)
+            buffer_secs = random.randint(0, 59)
+            
+            target_out_dt = actual_in_dt + timedelta(hours=WORK_HOURS_TARGET, minutes=buffer_mins, seconds=buffer_secs)
             
             target_out_dt = target_out_dt.replace(year=ub_now.year, month=ub_now.month, day=ub_now.day)
             
@@ -290,9 +292,11 @@ def plan_checkout_strategy():
             schedule.every().day.at(out_str).do(execute_punch, chat_id=chat_id, action_type="check_out").tag('daily')
             
             log(f"User {user['email']}: In at {in_str}. Scheduled Out: {out_str}")
-            send_telegram(chat_id, f"📅 **Өдрийн Төлөвлөгөө**\n✅ Ирсэн: `{in_str}`\n🎯 Явах цаг: `{out_str}`\n(9 цаг + {buffer_mins}мин)")
+            send_telegram(chat_id, f"📅 **Өдрийн Төлөвлөгөө**\n✅ Ирсэн: `{in_str}`\n🎯 Явах цаг: `{out_str}`\n(9 цаг + {buffer_mins}мин {buffer_secs}сек)")
         else:
-            fallback_time = f"18:{random.randint(15, 45):02d}:00"
+            rand_min = random.randint(15, 45)
+            rand_sec = random.randint(0, 59)
+            fallback_time = f"18:{rand_min:02d}:{rand_sec:02d}"
             
             schedule.every().day.at(fallback_time).do(execute_punch, chat_id=chat_id, action_type="check_out").tag('daily')
             
