@@ -10,6 +10,7 @@ import threading
 import os
 import sys
 from datetime import datetime, timedelta
+import janus_db as db
 
 
 BASE_URL = "https://erp.tbsolutions.mn"
@@ -441,6 +442,15 @@ def execute_punch(chat_id, action_type, message_id=None, source="scheduled"):
             )
             log(f"Success {action_type}: {user['email']}")
 
+            # Record in local DB
+            try:
+                if action_type == "check_in":
+                    db.record_checkin(chat_id, current_time, source=source)
+                else:
+                    db.record_checkout(chat_id, current_time, source=source)
+            except Exception as db_err:
+                log(f"DB record error: {db_err}")
+
             if message_id:
                 bot.edit_message_text(success_msg, chat_id, message_id, parse_mode="Markdown")
             else:
@@ -468,7 +478,10 @@ def unschedule_user(chat_id):
 def schedule_user_checkin(chat_id, user):
     ub_now = get_ub_time()
 
-    if ub_now.weekday() >= 5:
+    if not db.is_workday(ub_now.date()):
+        holiday = db.is_holiday(ub_now.date())
+        if holiday:
+            log(f"Skipping {user.get('email', '?')} — holiday: {holiday}")
         return
 
     if not user.get("auto_mode", True):
@@ -660,7 +673,7 @@ def plan_checkout_strategy():
     users = load_users()
     ub_now = get_ub_time()
 
-    if ub_now.weekday() >= 5:
+    if not db.is_workday(ub_now.date()):
         return
 
     success_count = 0
@@ -708,8 +721,10 @@ def plan_checkout_strategy():
 def schedule_all_users():
     ub_now = get_ub_time()
 
-    if ub_now.weekday() >= 5:
-        log("Weekend Mode. No tasks scheduled.")
+    if not db.is_workday(ub_now.date()):
+        holiday = db.is_holiday(ub_now.date())
+        reason = f"Holiday: {holiday}" if holiday else "Weekend"
+        log(f"{reason}. No tasks scheduled.")
         return
 
     users = load_users()
@@ -874,6 +889,75 @@ def replan_command(message):
         bot.send_message(message.chat.id, f"❌ Алдаа: {e}")
 
 
+@bot.message_handler(commands=['holidays'])
+def holidays_command(message):
+    year = get_ub_time().year
+    holidays = db.list_holidays(year)
+
+    if not holidays:
+        bot.reply_to(message, f"📅 {year} онд баяр бүртгэгдээгүй.")
+        return
+
+    msg = f"📅 **{year} оны баярын өдрүүд:**\n\n"
+    for h in holidays:
+        recurring = "🔁" if h["recurring"] else "📌"
+        msg += f"{recurring} `{h['date']}` — {h['name']}\n"
+
+    msg += f"\n🔁 = жил бүр, 📌 = зөвхөн энэ жил"
+    bot.reply_to(message, msg, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['addholiday'])
+def add_holiday_command(message):
+    ADMIN_CHAT_ID = 6190430690
+
+    if message.chat.id != ADMIN_CHAT_ID:
+        bot.reply_to(message, "❌ Зөвхөн админ ашиглах боломжтой.")
+        return
+
+    try:
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            bot.reply_to(
+                message,
+                "⚠️ Формат: `/addholiday 2026-02-17 Цагаан сар`\n"
+                "MM-DD формат бол жил бүр давтагдана.\n"
+                "Жишээ: `/addholiday 03-08 Эмэгтэйчүүдийн баяр`",
+                parse_mode="Markdown"
+            )
+            return
+
+        date_str = parts[1]
+        name = parts[2]
+        recurring = len(date_str) == 5  # MM-DD format
+
+        db.add_holiday(date_str, name, recurring)
+        r_text = "🔁 жил бүр" if recurring else "📌 зөвхөн энэ жил"
+        bot.reply_to(message, f"✅ Нэмэгдлээ: `{date_str}` — {name} ({r_text})", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Алдаа: {e}")
+
+
+@bot.message_handler(commands=['rmholiday'])
+def remove_holiday_command(message):
+    ADMIN_CHAT_ID = 6190430690
+
+    if message.chat.id != ADMIN_CHAT_ID:
+        bot.reply_to(message, "❌ Зөвхөн админ ашиглах боломжтой.")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "⚠️ Формат: `/rmholiday 2026-02-17`", parse_mode="Markdown")
+            return
+
+        db.remove_holiday(parts[1])
+        bot.reply_to(message, f"✅ `{parts[1]}` устгагдлаа.", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Алдаа: {e}")
+
+
 @bot.message_handler(commands=['allusers'])
 def all_users_command(message):
     ADMIN_CHAT_ID = 6190430690 
@@ -1009,11 +1093,13 @@ def handle_query(call):
             bot.send_message(chat_id, msg, parse_mode="Markdown")
             return
 
-        if ub_now.weekday() >= 5:
+        if not db.is_workday(ub_now.date()):
+            holiday = db.is_holiday(ub_now.date())
+            reason = f"🎉 {holiday}" if holiday else "🏖 Амралтын өдөр"
             bot.send_message(
                 chat_id,
                 f"🤖 **Хуваарь** — {today_str} ({day_name})\n\n"
-                f"🏖 Амралтын өдөр — хуваарь байхгүй.",
+                f"{reason} — хуваарь байхгүй.",
                 parse_mode="Markdown"
             )
             return
@@ -1135,6 +1221,69 @@ def handle_query(call):
         send_menu(call.message)
 
 
+def end_of_day_sweep():
+    """Force checkout anyone still checked in. Last safety net."""
+    ub_now = get_ub_time()
+
+    if not db.is_workday(ub_now.date()):
+        return
+
+    log("=== END OF DAY SWEEP ===")
+    users = load_users()
+    unchecked = db.get_unchecked_out_users()
+
+    if not unchecked:
+        # Also check ERP directly for anyone we missed in local DB
+        for chat_id, user in users.items():
+            if not user.get("auto_mode", True):
+                continue
+            try:
+                session, u_data = get_session(user['email'], user['password'])
+                if not session:
+                    continue
+                cal_data = get_calendar_data(session, u_data['uid'])
+                is_checked_in = cal_data[0].get("checked_in_today", False) if cal_data else False
+                _, actual_out = get_real_checkin_checkout_time(cal_data)
+
+                if is_checked_in and not actual_out:
+                    log(f"SWEEP: {user['email']} still checked in (found via ERP)")
+                    execute_punch(chat_id, "check_out", source="end_of_day_sweep")
+                    send_telegram(
+                        chat_id,
+                        f"🌙 **Автомат checkout хийгдлээ**\n"
+                        f"Та checkout хийхээ мартсан тул системээс автоматаар бүртгэлээ.\n"
+                        f"⏰ Цаг: `{ub_now.strftime('%H:%M')}`"
+                    )
+                time.sleep(random.uniform(1, 3))
+            except Exception as e:
+                log(f"Sweep ERP check error for {user.get('email', '?')}: {e}")
+        log("=== SWEEP COMPLETE (ERP check) ===")
+        return
+
+    for record in unchecked:
+        chat_id = record["chat_id"]
+        user = users.get(chat_id)
+        if not user:
+            continue
+        if not user.get("auto_mode", True):
+            continue
+
+        log(f"SWEEP: Force checkout {user['email']} (checked in at {record['check_in_time']})")
+        try:
+            execute_punch(chat_id, "check_out", source="end_of_day_sweep")
+            send_telegram(
+                chat_id,
+                f"🌙 **Автомат checkout хийгдлээ**\n"
+                f"Та checkout хийхээ мартсан тул системээс автоматаар бүртгэлээ.\n"
+                f"⏰ Цаг: `{ub_now.strftime('%H:%M')}`"
+            )
+        except Exception as e:
+            log(f"Sweep error for {user['email']}: {e}")
+        time.sleep(random.uniform(2, 5))
+
+    log("=== SWEEP COMPLETE ===")
+
+
 def run_scheduler():
     while True:
         schedule.run_pending()
@@ -1143,9 +1292,9 @@ def run_scheduler():
 
 def smart_recovery():
     ub_now = get_ub_time()
-    
-    if ub_now.weekday() >= 5:
-        log("Weekend - no recovery needed")
+
+    if not db.is_workday(ub_now.date()):
+        log("Not a workday - no recovery needed")
         return
     
     users = load_users()
@@ -1213,29 +1362,41 @@ def smart_recovery():
 def periodic_health_check():
     ub_now = get_ub_time()
     current_hour = ub_now.hour
-    
-    if ub_now.weekday() < 5 and 8 <= current_hour <= 20:
+
+    if db.is_workday(ub_now.date()) and 8 <= current_hour <= 20:
         smart_recovery()
 
 
 if __name__ == "__main__":
+    db.init_db()
+    log("Database initialized")
+
     schedule.every().day.at("01:00").do(
         _run_in_thread, schedule_all_users
     ).tag('system')
-    
+
     schedule.every(30).minutes.do(
         _run_in_thread, periodic_health_check
     ).tag('health_check')
 
+    # End-of-day sweep: force checkout anyone still checked in
+    schedule.every().day.at("19:45:00").do(
+        _run_in_thread, end_of_day_sweep
+    ).tag('end_of_day_sweep')
+
+    schedule.every().day.at("20:30:00").do(
+        _run_in_thread, end_of_day_sweep
+    ).tag('end_of_day_sweep')
+
     schedule_all_users()
-    
+
     threading.Thread(target=smart_recovery, daemon=True).start()
 
     t = threading.Thread(target=run_scheduler, daemon=True)
     t.start()
 
-    log("--- JANUS BOT STARTED (WITH SMART RECOVERY) ---")
-    log("Health check runs every 30 minutes during work hours")
+    log("--- JANUS BOT STARTED (WITH SMART RECOVERY + HOLIDAYS + DB) ---")
+    log("Health check: every 30min | End-of-day sweep: 19:45 & 20:30")
 
     while True:
         try:
